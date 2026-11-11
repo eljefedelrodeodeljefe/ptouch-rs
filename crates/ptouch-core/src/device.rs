@@ -44,6 +44,9 @@ bitflags! {
         const AUTO_STATUS_NOTIFICATION = 1 << 9;
         /// PT-E550W raster, media and optional status-query behavior.
         const E550W_RASTER = 1 << 10;
+        /// Device takes the cut, chain and margin settings (ESC i M, ESC i A,
+        /// ESC i K, ESC i d) with every page, as in Brother's raster references.
+        const CUT_SETTINGS = 1 << 11;
     }
 }
 
@@ -346,7 +349,10 @@ static DEVICE_TABLE: &[DeviceInfo] = &[
         dpi: 180,
         flags: DeviceFlags::P700_INIT
             .union(DeviceFlags::USE_INFO_CMD)
-            .union(DeviceFlags::D460BT_MAGIC),
+            .union(DeviceFlags::D460BT_MAGIC)
+            .union(DeviceFlags::HAS_PRECUT)
+            .union(DeviceFlags::AUTO_STATUS_NOTIFICATION)
+            .union(DeviceFlags::CUT_SETTINGS),
     },
     // This model uses PackBits/P700 commands, without D460BT_MAGIC.
     DeviceInfo {
@@ -456,8 +462,36 @@ mod tests {
     }
 
     #[test]
+    fn test_e560bt_status_and_cut_capabilities() {
+        let dev = find_device(0x04f9, 0x2203).unwrap();
+        assert_eq!(dev.name, "PT-E560BT");
+        assert!(dev.flags.contains(DeviceFlags::AUTO_STATUS_NOTIFICATION));
+        assert!(dev.flags.contains(DeviceFlags::HAS_PRECUT));
+        assert!(dev.flags.contains(DeviceFlags::CUT_SETTINGS));
+        assert!(dev.flags.contains(DeviceFlags::D460BT_MAGIC));
+    }
+
+    #[test]
+    fn cut_settings_are_limited_to_documented_models() {
+        // 0x2203 (PT-E560BT): sequence from its raster reference. The PT-E510
+        // shares the reference and the automatic cutter, untested. The
+        // PT-E310BT has a manual cutter: auto cut makes it wait for the
+        // user, so it stays opt-in through --precut.
+        let opted_in_pids = [0x2203];
+
+        for dev in supported_devices() {
+            assert_eq!(
+                dev.flags.contains(DeviceFlags::CUT_SETTINGS),
+                opted_in_pids.contains(&dev.pid),
+                "unexpected cut-settings capability for {}",
+                dev.name
+            );
+        }
+    }
+
+    #[test]
     fn automatic_status_command_is_limited_to_documented_models() {
-        let opted_in_pids = [0x20af, 0x2201];
+        let opted_in_pids = [0x20af, 0x2201, 0x2203];
 
         for dev in supported_devices() {
             assert_eq!(

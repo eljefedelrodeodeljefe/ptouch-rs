@@ -53,6 +53,11 @@ PT-E720BT USB printing with 24 mm laminated tape and automatic cutting was
 [confirmed on Apple silicon](https://github.com/vowstar/ptouch-rs/issues/49#issuecomment-6564949140)
 with v0.15.0.
 
+PT-E560BT USB printing turns on status notification, so a label is reported as
+finished when the printer confirms it. Every label carries Brother's documented
+cut and margin settings: the last label is fed and cut, `--precut` also cuts
+between labels and copies, and `--chain` leaves the tape uncut.
+
 PT-E550W USB support uses the model's TZe print areas. If the printer does not
 report its tape, select the installed TZe width in the GUI. CLI printing accepts
 `--media-width 12` for a 12 mm cassette, or uses the width saved in a layout.

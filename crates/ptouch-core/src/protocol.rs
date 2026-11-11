@@ -80,6 +80,13 @@ pub fn cmd_enable_packbits() -> Vec<u8> {
     vec![0x4D, 0x02]
 }
 
+/// Construct the no-compression select command.
+///
+/// Sends M 0x00, so raster lines are transferred as plain `G` data.
+pub fn cmd_disable_compression() -> Vec<u8> {
+    vec![0x4D, 0x00]
+}
+
 /// Construct a line feed command.
 ///
 /// Sends 0x5A to advance one raster line without printing.
@@ -148,6 +155,13 @@ pub fn cmd_precut(enabled: bool) -> Vec<u8> {
     vec![0x1B, 0x69, 0x4D, if enabled { 0x40 } else { 0x00 }]
 }
 
+/// Construct the "cut each * labels" command (ESC i A).
+///
+/// With auto cut enabled, the printer cuts after every `labels` pages.
+pub fn cmd_cut_each(labels: u8) -> Vec<u8> {
+    vec![0x1B, 0x69, 0x41, labels]
+}
+
 /// Construct the legacy print information command (ESC i c).
 ///
 /// Used by the PT-9500PC generation of 360 dpi printers.
@@ -202,6 +216,10 @@ pub fn cmd_advanced_mode(
 ///   n1/n2: margin value as LE u16 (0x0001 = minimal margin)
 ///   n3: must be 0x4D or the print gets corrupted
 ///   n4: reserved (0x00)
+///
+/// Read against the PT-E310BT/PT-E560BT raster reference, these bytes are
+/// two commands: ESC i d with a one dot margin, then M 0x00 (no compression).
+/// Devices with `CUT_SETTINGS` send both explicitly instead.
 pub fn cmd_d460bt_magic() -> Vec<u8> {
     vec![0x1B, 0x69, 0x64, 0x01, 0x00, 0x4D, 0x00]
 }
@@ -264,6 +282,9 @@ pub fn cmd_page_flags(margin: u16) -> Vec<u8> {
     ]
 }
 
+/// Minimum feed margin of the 180 dpi models (2 mm), in dots.
+pub const MIN_FEED_MARGIN_DOTS: u16 = 14;
+
 /// Create a blank raster line of the given width in pixels.
 ///
 /// Returns a zeroed byte buffer of length `ceil(max_px / 8)`.
@@ -293,6 +314,10 @@ pub struct JobOptions {
 ///
 /// Sequence: rasterstart -> info -> d460bt_magic -> precut ->
 /// d460bt_chain -> packbits -> raster lines -> finalize
+///
+/// Devices with `CUT_SETTINGS` replace d460bt_magic, precut and
+/// d460bt_chain with the documented per-page settings: auto cut -> cut each
+/// label -> advanced mode -> margin -> compression select.
 ///
 /// The compression select (M) is the last control code before the raster
 /// data, as specified by the Brother raster command references (e.g.
@@ -335,30 +360,39 @@ pub fn build_print_job(lines: &[Vec<u8>], flags: DeviceFlags, opts: &JobOptions)
         job.push(cmd_info(opts.media_width, line_count, flags));
     }
 
-    if is_d460bt {
+    let cut_settings = flags.contains(DeviceFlags::CUT_SETTINGS);
+
+    if is_d460bt && !cut_settings {
         job.push(cmd_d460bt_magic());
     }
 
-    if e550w {
-        job.push(cmd_precut(opts.precut));
-        job.push(vec![0x1b, 0x69, 0x41, 1]); // Cut each label when enabled.
+    if e550w || cut_settings {
+        // Brother's reference sequence enables auto cut for a page that ends
+        // with a feed and cut, so the final label needs it as well as an
+        // explicit --precut. Sending every setting with every page also keeps
+        // a chained page from leaving its chain mode set for the last one.
+        let auto_cut = opts.precut || (cut_settings && !opts.chain_print);
+        job.push(cmd_precut(auto_cut));
+        job.push(cmd_cut_each(1)); // Cut each label when enabled.
         job.push(cmd_advanced_mode(
             PrintQuality::Standard,
             false,
             !opts.chain_print,
             false,
         ));
-        job.push(vec![0x1b, 0x69, 0x64, 14, 0]); // 180 dpi minimum feed margin.
+        job.push(cmd_page_flags(MIN_FEED_MARGIN_DOTS));
     } else if flags.contains(DeviceFlags::HAS_PRECUT) && opts.precut {
         job.push(cmd_precut(true));
     }
 
-    if is_d460bt && opts.chain_print {
+    if is_d460bt && opts.chain_print && !cut_settings {
         job.push(cmd_d460bt_chain());
     }
 
     if use_packbits {
         job.push(cmd_enable_packbits());
+    } else if cut_settings {
+        job.push(cmd_disable_compression());
     }
 
     for line in selected {
@@ -544,6 +578,16 @@ mod tests {
     }
 
     #[test]
+    fn test_cmd_cut_each_and_compression_select() {
+        assert_eq!(cmd_cut_each(1), vec![0x1B, 0x69, 0x41, 0x01]);
+        assert_eq!(cmd_disable_compression(), vec![0x4D, 0x00]);
+        assert_eq!(
+            cmd_page_flags(MIN_FEED_MARGIN_DOTS),
+            [0x1B, 0x69, 0x64, 14, 0]
+        );
+    }
+
+    #[test]
     fn test_cmd_page_flags() {
         let cmd = cmd_page_flags(0x0300);
         assert_eq!(cmd, vec![0x1B, 0x69, 0x64, 0x00, 0x03]);
@@ -674,6 +718,65 @@ mod tests {
         ]
         .concat();
         assert_eq!(flat(&job), expected);
+    }
+
+    #[test]
+    fn test_job_e560bt_cut_settings() {
+        // PT-E560BT: every page states its cut, chain and margin settings.
+        // Sequence and values follow section 2.1 of the PT-E310BT/PT-E560BT
+        // raster reference; the raster data stays uncompressed.
+        let flags = crate::device::find_device(0x04f9, 0x2203).unwrap().flags;
+        let lines = vec![vec![0xFF; 16], vec![0x00; 16]];
+        let mut raster = vec![0x47, 0x10, 0x00];
+        raster.extend([0xFF; 16]);
+        // (precut, chain) -> (ESC i M, ESC i K)
+        for (precut, chain, auto_cut, advanced) in [
+            (false, false, 0x40, 0x08), // single label: feed and cut
+            (false, true, 0x00, 0x00),  // chained strip: no cut, no feed
+            (true, false, 0x40, 0x08),  // last label of a cut series
+            (true, true, 0x40, 0x00),   // cut each label, keep the last one
+        ] {
+            let opts = JobOptions {
+                media_width: 24,
+                chain_print: chain,
+                precut,
+                quality: PrintQuality::Standard,
+            };
+            let job = build_print_job(&lines, flags, &opts);
+            let expected: Vec<Vec<u8>> = vec![
+                vec![0x1B, 0x69, 0x61, 0x01], // ESC i a 01 raster mode
+                vec![
+                    0x1B, 0x69, 0x7A, 0x00, 0x00, 24, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00,
+                ], // ESC i z info
+                vec![0x1B, 0x69, 0x4D, auto_cut], // ESC i M auto cut
+                vec![0x1B, 0x69, 0x41, 0x01], // ESC i A cut each label
+                vec![0x1B, 0x69, 0x4B, advanced], // ESC i K no chain printing
+                vec![0x1B, 0x69, 0x64, 0x0E, 0x00], // ESC i d 14 dot margin
+                vec![0x4D, 0x00],             // M 00, last before data
+                raster.clone(),               // G, uncompressed
+                vec![0x5A],                   // Z blank line
+                vec![0x1A],                   // print with feeding
+            ];
+            assert_eq!(job, expected, "precut={precut}, chain={chain}");
+        }
+    }
+
+    #[test]
+    fn test_job_cut_settings_do_not_change_other_d460bt_models() {
+        // PT-E310BT (manual cutter) and PT-E510 keep the verified stream.
+        for pid in [0x2201, 0x2202, 0x20e0] {
+            let flags = crate::device::find_device(0x04f9, pid).unwrap().flags;
+            let opts = JobOptions {
+                media_width: 12,
+                ..JobOptions::default()
+            };
+            let job = build_print_job(&[vec![0x01]], flags, &opts);
+            assert_eq!(job[2], cmd_d460bt_magic());
+            let bytes = flat(&job);
+            assert!(!bytes.windows(3).any(|w| w == [0x1B, 0x69, 0x4D]));
+            assert!(!bytes.windows(3).any(|w| w == [0x1B, 0x69, 0x41]));
+            assert!(!bytes.windows(3).any(|w| w == [0x1B, 0x69, 0x4B]));
+        }
     }
 
     /// Flags of the PT-9700PC as listed in the device table.

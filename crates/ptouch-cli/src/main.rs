@@ -741,6 +741,9 @@ fn format_flags(dev: &DeviceInfo) -> String {
     if dev.flags.contains(DeviceFlags::AUTO_STATUS_NOTIFICATION) {
         parts.push("auto-status");
     }
+    if dev.flags.contains(DeviceFlags::CUT_SETTINGS) {
+        parts.push("cut-settings");
+    }
     if parts.is_empty() {
         String::new()
     } else {

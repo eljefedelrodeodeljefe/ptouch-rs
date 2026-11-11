@@ -1535,6 +1535,69 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn e560bt_copies_wait_for_completion_and_only_the_last_page_feeds_and_cuts() {
+        let info = crate::device::find_device(0x04f9, 0x2203).unwrap();
+        let transport = ScriptedTransport::new();
+        let mut status = status_packet(0, 0);
+        status[..13]
+            .copy_from_slice(&[0x80, 0x20, 0x42, 0x30, 0x7f, 0x30, 0x30, 0, 0, 0, 24, 1, 0]);
+        transport.status_reply.set(Some(status));
+        let mut session = PrinterSession::new(transport, info.into());
+        session.init().unwrap();
+        assert_eq!(session.tape_width_px(), Some(128));
+        assert_eq!(
+            *session.transport.writes.borrow(),
+            vec![
+                protocol::cmd_init(),
+                vec![0x1b, 0x69, 0x53],
+                vec![0x1b, 0x69, 0x21, 0], // ESC i ! 00: notify
+            ]
+        );
+
+        let mut raster = vec![0x47, 0x10, 0];
+        raster.extend([0xff; 16]);
+        // Chained copies leave the tape uncut; the last one states its own
+        // feed and cut instead of inheriting the chain mode.
+        for (chain, auto_cut, advanced) in [(true, 0, 0), (true, 0, 0), (false, 0x40, 8)] {
+            session.transport.writes.borrow_mut().clear();
+            let mut printing = status;
+            printing[18] = 6;
+            printing[19] = 1;
+            let mut completed = status;
+            completed[18] = 1;
+            completed[19] = 1;
+            session
+                .transport
+                .reads
+                .borrow_mut()
+                .extend([printing.to_vec(), completed.to_vec()]);
+            session
+                .print_raster(
+                    &[vec![0xff; 16]],
+                    chain,
+                    false,
+                    protocol::PrintQuality::Standard,
+                )
+                .unwrap();
+            assert_eq!(session.status().unwrap().status_type, 1);
+            assert_eq!(
+                *session.transport.writes.borrow(),
+                vec![
+                    vec![0x1b, 0x69, 0x61, 1],
+                    vec![0x1b, 0x69, 0x7a, 0, 0, 24, 0, 1, 0, 0, 0, 2, 0],
+                    vec![0x1b, 0x69, 0x4d, auto_cut],
+                    vec![0x1b, 0x69, 0x41, 1],
+                    vec![0x1b, 0x69, 0x4b, advanced],
+                    vec![0x1b, 0x69, 0x64, 14, 0],
+                    vec![0x4d, 0],
+                    raster.clone(),
+                    vec![0x1a],
+                ]
+            );
+        }
+    }
+
     fn p300bt_packet(kind: u8, phase: u8) -> [u8; STATUS_PACKET_SIZE] {
         let mut packet = status_packet(kind, phase);
         packet[2] = 0x42;
